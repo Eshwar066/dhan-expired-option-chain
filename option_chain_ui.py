@@ -144,6 +144,25 @@ def build_chain_data(
     return result
 
 
+def row_color_by_moneyness(row: pd.Series, basis: str) -> list[str]:
+    """ATM=yellow, ITM=green, OTM=red. Uses atm_label / atm_distance vs CALL/PUT."""
+    distance = row.get("atm_distance")
+    if pd.isna(distance) or distance is None:
+        label = row.get("atm_label")
+        if label is None or (isinstance(label, float) and pd.isna(label)):
+            return [""] * len(row)
+        distance = parse_atm_label(str(label))
+
+    if distance == 0:
+        color = "#fff3cd"  # ATM
+    elif basis == "CALL":
+        color = "#d4edda" if distance < 0 else "#f8d7da"  # ITM vs OTM for calls
+    else:
+        color = "#d4edda" if distance > 0 else "#f8d7da"  # ITM vs OTM for puts
+
+    return [f"background-color: {color}"] * len(row)
+
+
 st.set_page_config(page_title="Historical Option Chain UI", layout="wide")
 st.title("Historical Option Chain UI")
 st.caption("Filter by date range, expiry and time to view CE/PE side-by-side.")
@@ -192,6 +211,13 @@ with filter_col2:
 with filter_col3:
     time_value = st.time_input("Time", value=dt.time(9, 15))
 
+moneyness_basis = st.radio(
+    "Row colors (ATM / ITM / OTM)",
+    options=["CALL", "PUT"],
+    horizontal=True,
+    help="ATM=yellow, ITM=green, OTM=red. ITM/OTM follows the selected option side.",
+)
+
 if from_date > to_date:
     st.error("From Date must be before or equal to To Date.")
     st.stop()
@@ -217,12 +243,12 @@ if chain_df.empty:
 chain_df["spot"] = chain_df.get("CE_spot").combine_first(chain_df.get("PE_spot"))
 
 display_columns = [
-    # "datetime",
+    "datetime",
     "atm_label",
-    # "spot",
-    # "CE_open",
-    # "CE_high",
-    # "CE_low",
+    "spot",
+    "CE_open",
+    "CE_high",
+    "CE_low",
     "CE_volume",
     "CE_iv",
     "CE_oi",
@@ -230,9 +256,9 @@ display_columns = [
     "CE_strike",
     "PE_strike",
     "PE_close",
-    # "PE_open",
-    # "PE_high",
-    # "PE_low",
+    "PE_open",
+    "PE_high",
+    "PE_low",
     "PE_volume",
     "PE_iv",
     "PE_oi",
@@ -244,7 +270,11 @@ for col in display_columns:
         chain_df[col] = pd.NA
 
 st.subheader("All Matching Rows")
-st.dataframe(chain_df[display_columns], use_container_width=True, hide_index=True)
+st.caption("Legend: **ATM** = yellow · **ITM** = green · **OTM** = red")
+all_styled = chain_df[display_columns].style.apply(
+    row_color_by_moneyness, axis=1, basis=moneyness_basis
+)
+st.dataframe(all_styled, use_container_width=True)
 
 st.subheader("Latest Snapshot In Range")
 latest_ts = chain_df["datetime"].max()
@@ -259,7 +289,10 @@ if not spot_series.empty:
 else:
     st.info("NIFTY spot not available for selected filters.")
 
-st.dataframe(latest_snapshot[display_columns], use_container_width=True, hide_index=True)
+latest_styled = latest_snapshot[display_columns].style.apply(
+    row_color_by_moneyness, axis=1, basis=moneyness_basis
+)
+st.dataframe(latest_styled, use_container_width=True)
 
 csv_bytes = chain_df.to_csv(index=False).encode("utf-8")
 st.download_button(
