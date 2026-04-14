@@ -71,7 +71,7 @@ def build_chain_data(
     strikes: list[str],
     from_date: dt.date,
     to_date: dt.date,
-    time_filter: dt.time,
+    time_filter: dt.time | None,
 ) -> pd.DataFrame:
     frames = []
     root_path = Path(root)
@@ -88,7 +88,8 @@ def build_chain_data(
 
         if not ce.empty:
             ce = ce[(ce["datetime"] >= start_ts) & (ce["datetime"] <= end_ts)]
-            ce = ce[ce["datetime"].dt.time == time_filter]
+            if time_filter is not None:
+                ce = ce[ce["datetime"].dt.time == time_filter]
             ce = ce.rename(
                 columns={
                     "open": "CE_open",
@@ -105,7 +106,8 @@ def build_chain_data(
 
         if not pe.empty:
             pe = pe[(pe["datetime"] >= start_ts) & (pe["datetime"] <= end_ts)]
-            pe = pe[pe["datetime"].dt.time == time_filter]
+            if time_filter is not None:
+                pe = pe[pe["datetime"].dt.time == time_filter]
             pe = pe.rename(
                 columns={
                     "open": "PE_open",
@@ -269,35 +271,118 @@ for col in display_columns:
     if col not in chain_df.columns:
         chain_df[col] = pd.NA
 
-st.subheader("All Matching Rows")
-st.caption("Legend: **ATM** = yellow · **ITM** = green · **OTM** = red")
-all_styled = chain_df[display_columns].style.apply(
-    row_color_by_moneyness, axis=1, basis=moneyness_basis
-)
-st.dataframe(all_styled, use_container_width=True)
+tab1, tab2 = st.tabs(["Chain View", "Range Strike Table"])
 
-st.subheader("Latest Snapshot In Range")
-latest_ts = chain_df["datetime"].max()
-latest_snapshot = chain_df[chain_df["datetime"] == latest_ts].copy()
-latest_snapshot = latest_snapshot.sort_values("atm_distance")
-st.write(f"Snapshot time: `{latest_ts}`")
+with tab1:
+    st.subheader("All Matching Rows")
+    st.caption("Legend: **ATM** = yellow · **ITM** = green · **OTM** = red")
+    all_styled = chain_df[display_columns].style.apply(
+        row_color_by_moneyness, axis=1, basis=moneyness_basis
+    )
+    st.dataframe(all_styled, use_container_width=True)
 
-spot_series = latest_snapshot["spot"].dropna()
-if not spot_series.empty:
-    nifty_spot = float(spot_series.median())
-    st.metric("NIFTY Spot At Selected Time", f"{nifty_spot:.2f}")
-else:
-    st.info("NIFTY spot not available for selected filters.")
+    st.subheader("Latest Snapshot In Range")
+    latest_ts = chain_df["datetime"].max()
+    latest_snapshot = chain_df[chain_df["datetime"] == latest_ts].copy()
+    latest_snapshot = latest_snapshot.sort_values("atm_distance")
+    st.write(f"Snapshot time: `{latest_ts}`")
 
-latest_styled = latest_snapshot[display_columns].style.apply(
-    row_color_by_moneyness, axis=1, basis=moneyness_basis
-)
-st.dataframe(latest_styled, use_container_width=True)
+    spot_series = latest_snapshot["spot"].dropna()
+    if not spot_series.empty:
+        nifty_spot = float(spot_series.median())
+        st.metric("NIFTY Spot At Selected Time", f"{nifty_spot:.2f}")
+    else:
+        st.info("NIFTY spot not available for selected filters.")
 
-csv_bytes = chain_df.to_csv(index=False).encode("utf-8")
-st.download_button(
-    label="Download Filtered Data (CSV)",
-    data=csv_bytes,
-    file_name=f"{symbol}_{expiry}_{from_date}_{to_date}_{time_value}.csv",
-    mime="text/csv",
-)
+    latest_styled = latest_snapshot[display_columns].style.apply(
+        row_color_by_moneyness, axis=1, basis=moneyness_basis
+    )
+    st.dataframe(latest_styled, use_container_width=True)
+
+    csv_bytes = chain_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download Filtered Data (CSV)",
+        data=csv_bytes,
+        file_name=f"{symbol}_{expiry}_{from_date}_{to_date}_{time_value}.csv",
+        mime="text/csv",
+    )
+
+with tab2:
+    st.subheader("Strike Wise Table (All Available Times)")
+    st.caption(
+        "Choose one strike and side. You will get all available timestamps in the selected date range."
+    )
+
+    all_times_df = build_chain_data(
+        root=selected_root,
+        symbol=symbol,
+        expiry=expiry,
+        strikes=selected_strikes,
+        from_date=from_date,
+        to_date=to_date,
+        time_filter=None,
+    )
+
+    if all_times_df.empty:
+        st.warning("No rows matched these filters for all-time view.")
+    else:
+        all_times_df["spot"] = all_times_df.get("CE_spot").combine_first(
+            all_times_df.get("PE_spot")
+        )
+
+        side_col1, side_col2 = st.columns(2)
+        with side_col1:
+            side_choice = st.radio(
+                "Option Side",
+                options=["CALL", "PUT"],
+                horizontal=True,
+                key="strike_side_choice",
+            )
+
+        strike_col = "CE_strike" if side_choice == "CALL" else "PE_strike"
+        metric_prefix = "CE" if side_choice == "CALL" else "PE"
+        strike_values = (
+            pd.to_numeric(all_times_df.get(strike_col), errors="coerce")
+            .dropna()
+            .astype(int)
+            .sort_values()
+            .unique()
+            .tolist()
+        )
+
+        if not strike_values:
+            st.warning(f"No {side_choice} strike values found in this range.")
+        else:
+            with side_col2:
+                selected_abs_strike = st.selectbox(
+                    f"Select {side_choice} Strike",
+                    options=strike_values,
+                    index=0,
+                    key="selected_abs_strike",
+                )
+
+            strike_mask = (
+                pd.to_numeric(all_times_df[strike_col], errors="coerce")
+                == float(selected_abs_strike)
+            )
+            strike_rows = all_times_df[strike_mask].copy()
+            strike_rows = strike_rows.sort_values("datetime").reset_index(drop=True)
+
+            table_columns = [
+                "datetime",
+                "atm_label",
+                "spot",
+                f"{metric_prefix}_strike",
+                f"{metric_prefix}_open",
+                f"{metric_prefix}_high",
+                f"{metric_prefix}_low",
+                f"{metric_prefix}_close",
+                f"{metric_prefix}_volume",
+                f"{metric_prefix}_iv",
+                f"{metric_prefix}_oi",
+            ]
+            for col in table_columns:
+                if col not in strike_rows.columns:
+                    strike_rows[col] = pd.NA
+
+            st.dataframe(strike_rows[table_columns], use_container_width=True)
