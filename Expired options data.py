@@ -8,8 +8,8 @@ import os
 client_id    = "1000690797"
 access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc2MTc2MzMxLCJpYXQiOjE3NzYwODk5MzEsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMDAwNjkwNzk3In0.V2bsKdfP-t6duBE6_FU2NY9y67bNmi0unNzLsKa_ft68CkzsfjOYUxr70_C_uZKYES2gFFTh-d5dSxJpWcY5Sw"
 tsl          = Tradehull(client_id, access_token)
-folder       = "Monthly Options data 15 mins"
-
+folder       = "Monthly Options data 60 mins"
+timeframe=60
 
 watchlist    = ["NIFTY"]
 expiries     = ["2025-01-30", "2025-02-27", "2025-03-27", "2025-04-24", "2025-05-29", "2025-06-26", "2025-07-31", "2025-08-28", "2025-09-25", "2025-09-30", "2025-10-28", "2025-11-25", "2025-12-30"]
@@ -30,7 +30,7 @@ for name in watchlist:
 					security_id = security_ids.get(name)
 					if security_id is None:
 						raise ValueError(f"Missing security ID for {name}")
-					data      = tsl.get_expired_option_data(exchangeSegment="NSE_FNO",instrument="OPTIDX",fromDate=from_date,toDate=expiry,exchange="NSE",interval=15,securityId=security_id,expiry_flag="MONTH",expiry_code=1,strike=rangex,option_type=right)
+					data      = tsl.get_expired_option_data(exchangeSegment="NSE_FNO",instrument="OPTIDX",fromDate=from_date,toDate=expiry,exchange="NSE",interval=timeframe,securityId=security_id,expiry_flag="MONTH",expiry_code=1,strike=rangex,option_type=right)
 					file_name = f"{name}_{expiry}_{right}.csv"
 					path      = f"{folder}/ATM Wise data/{name}/{expiry}/{rangex}"
 					os.makedirs(path, exist_ok=True)
