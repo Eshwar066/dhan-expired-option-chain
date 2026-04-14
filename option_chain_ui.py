@@ -21,7 +21,7 @@ def parse_atm_label(label: str) -> int:
 @st.cache_data
 def discover_data_roots() -> list[Path]:
     roots = []
-    for path in WORKSPACE_ROOT.glob("*Options data 15 mins"):
+    for path in WORKSPACE_ROOT.glob("*"):
         atm_wise = path / "ATM Wise data"
         if atm_wise.exists():
             roots.append(atm_wise)
