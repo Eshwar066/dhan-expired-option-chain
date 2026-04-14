@@ -1,11 +1,13 @@
 from pathlib import Path
 import datetime as dt
+import math
 
 import pandas as pd
 import streamlit as st
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent
+RISK_FREE_RATE = 0.05
 
 
 def parse_atm_label(label: str) -> int:
@@ -62,6 +64,104 @@ def load_leg_data(csv_path: str) -> pd.DataFrame:
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     df = df.dropna(subset=["datetime"])
     return df
+
+
+def _safe_float(value) -> float | None:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _year_fraction(expiry_dt: pd.Timestamp, ts: pd.Timestamp) -> float:
+    if pd.isna(expiry_dt) or pd.isna(ts):
+        return 0.0
+    delta_seconds = max((expiry_dt - ts).total_seconds(), 0.0)
+    return max(delta_seconds / (365.0 * 24.0 * 60.0 * 60.0), 1e-9)
+
+
+def _black_scholes_delta(
+    spot: float,
+    strike: float,
+    iv_raw: float,
+    time_to_expiry_years: float,
+    option_type: str,
+    rate: float = RISK_FREE_RATE,
+) -> float | None:
+    if (
+        spot is None
+        or strike is None
+        or iv_raw is None
+        or spot <= 0
+        or strike <= 0
+        or time_to_expiry_years <= 0
+    ):
+        return None
+    sigma = float(iv_raw)
+    if sigma > 1.0:
+        sigma = sigma / 100.0
+    if sigma <= 0:
+        return None
+
+    sqrt_t = math.sqrt(time_to_expiry_years)
+    d1 = (
+        math.log(spot / strike)
+        + (rate + 0.5 * sigma * sigma) * time_to_expiry_years
+    ) / (sigma * sqrt_t)
+
+    nd1 = _norm_cdf(d1)
+    if option_type.upper() in ("CALL", "CE"):
+        return nd1
+    return nd1 - 1.0
+
+
+def add_delta_columns(df: pd.DataFrame, expiry: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    expiry_dt = pd.to_datetime(expiry, errors="coerce")
+    if pd.isna(expiry_dt):
+        out["CE_delta"] = pd.NA
+        out["PE_delta"] = pd.NA
+        return out
+    # End-of-day expiry assumption for intraday bars.
+    expiry_dt = expiry_dt + pd.Timedelta(hours=15, minutes=30)
+
+    ce_delta = []
+    pe_delta = []
+    for _, row in out.iterrows():
+        ts = pd.to_datetime(row.get("datetime"), errors="coerce")
+        tte = _year_fraction(expiry_dt, ts)
+        spot = _safe_float(row.get("spot"))
+
+        ce_delta.append(
+            _black_scholes_delta(
+                spot=spot,
+                strike=_safe_float(row.get("CE_strike")),
+                iv_raw=_safe_float(row.get("CE_iv")),
+                time_to_expiry_years=tte,
+                option_type="CALL",
+            )
+        )
+        pe_delta.append(
+            _black_scholes_delta(
+                spot=spot,
+                strike=_safe_float(row.get("PE_strike")),
+                iv_raw=_safe_float(row.get("PE_iv")),
+                time_to_expiry_years=tte,
+                option_type="PUT",
+            )
+        )
+
+    out["CE_delta"] = ce_delta
+    out["PE_delta"] = pe_delta
+    return out
 
 
 def build_chain_data(
@@ -243,6 +343,7 @@ if chain_df.empty:
     st.stop()
 
 chain_df["spot"] = chain_df.get("CE_spot").combine_first(chain_df.get("PE_spot"))
+chain_df = add_delta_columns(chain_df, expiry=expiry)
 
 display_columns = [
     "datetime",
@@ -253,6 +354,7 @@ display_columns = [
     "CE_low",
     "CE_volume",
     "CE_iv",
+    "CE_delta",
     "CE_oi",
     "CE_close",
     "CE_strike",
@@ -263,6 +365,7 @@ display_columns = [
     "PE_low",
     "PE_volume",
     "PE_iv",
+    "PE_delta",
     "PE_oi",
     
 ]
@@ -329,6 +432,7 @@ with tab2:
         all_times_df["spot"] = all_times_df.get("CE_spot").combine_first(
             all_times_df.get("PE_spot")
         )
+        all_times_df = add_delta_columns(all_times_df, expiry=expiry)
 
         side_col1, side_col2 = st.columns(2)
         with side_col1:
@@ -379,6 +483,7 @@ with tab2:
                 f"{metric_prefix}_close",
                 f"{metric_prefix}_volume",
                 f"{metric_prefix}_iv",
+                f"{metric_prefix}_delta",
                 f"{metric_prefix}_oi",
             ]
             for col in table_columns:
