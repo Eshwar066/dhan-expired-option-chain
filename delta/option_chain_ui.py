@@ -9,7 +9,8 @@ import streamlit as st
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
-DATA_ROOT = WORKSPACE_ROOT / "delta" / "BTC-2026"
+OPTIONS_DATA_ROOT = WORKSPACE_ROOT / "delta" / "BTC-2026"
+FUTURES_DATA_ROOT = WORKSPACE_ROOT / "delta" / "F-BTC-2026"
 
 
 def month_bounds(year: int, month: int) -> tuple[dt.date, dt.date]:
@@ -22,7 +23,8 @@ def discover_monthly_files(root_dir: str) -> list[str]:
     root = Path(root_dir)
     if not root.exists():
         return []
-    files = sorted(root.glob("**/*.csv"))
+    # Some folders are suffixed with ".csv"; keep only real files.
+    files = sorted(p for p in root.glob("**/*.csv") if p.is_file())
     return [str(p) for p in files]
 
 
@@ -69,16 +71,19 @@ def load_trades_filtered(
     files: tuple[str, ...],
     from_date: dt.date,
     to_date: dt.date,
-    time_filter: dt.time,
+    time_filter: dt.time | None,
 ) -> pd.DataFrame:
     start_ts = pd.Timestamp(from_date)
     end_ts = pd.Timestamp(to_date) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
 
     frames: list[pd.DataFrame] = []
-    selected_hour = time_filter.hour
-    selected_minute = time_filter.minute
+    selected_hour = None if time_filter is None else time_filter.hour
+    selected_minute = None if time_filter is None else time_filter.minute
 
     for file_path in files:
+        file_obj = Path(file_path)
+        if not file_obj.is_file():
+            continue
         for chunk in pd.read_csv(
             file_path,
             usecols=["product_symbol", "price", "size", "timestamp", "buyer_role"],
@@ -90,13 +95,14 @@ def load_trades_filtered(
             if chunk.empty:
                 continue
 
-            # Match minute to emulate "time snapshot" from intraday data.
-            chunk = chunk[
-                (chunk["timestamp"].dt.hour == selected_hour)
-                & (chunk["timestamp"].dt.minute == selected_minute)
-            ]
-            if chunk.empty:
-                continue
+            if selected_hour is not None and selected_minute is not None:
+                # Match minute to emulate "time snapshot" from intraday data.
+                chunk = chunk[
+                    (chunk["timestamp"].dt.hour == selected_hour)
+                    & (chunk["timestamp"].dt.minute == selected_minute)
+                ]
+                if chunk.empty:
+                    continue
 
             chunk = parse_product_symbol(chunk)
             if chunk.empty:
@@ -114,8 +120,63 @@ def load_trades_filtered(
     return pd.concat(frames, ignore_index=True)
 
 
+@st.cache_data
+def load_futures_spot(
+    files: tuple[str, ...],
+    from_date: dt.date,
+    to_date: dt.date,
+    time_filter: dt.time | None,
+) -> pd.DataFrame:
+    start_ts = pd.Timestamp(from_date)
+    end_ts = pd.Timestamp(to_date) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+
+    selected_hour = None if time_filter is None else time_filter.hour
+    selected_minute = None if time_filter is None else time_filter.minute
+    frames: list[pd.DataFrame] = []
+
+    for file_path in files:
+        file_obj = Path(file_path)
+        if not file_obj.is_file():
+            continue
+        for chunk in pd.read_csv(
+            file_path,
+            usecols=["price", "timestamp"],
+            chunksize=300_000,
+        ):
+            chunk["timestamp"] = pd.to_datetime(chunk["timestamp"], errors="coerce")
+            chunk["price"] = pd.to_numeric(chunk["price"], errors="coerce")
+            chunk = chunk.dropna(subset=["timestamp", "price"])
+            chunk = chunk[(chunk["timestamp"] >= start_ts) & (chunk["timestamp"] <= end_ts)]
+            if chunk.empty:
+                continue
+
+            if selected_hour is not None and selected_minute is not None:
+                chunk = chunk[
+                    (chunk["timestamp"].dt.hour == selected_hour)
+                    & (chunk["timestamp"].dt.minute == selected_minute)
+                ]
+                if chunk.empty:
+                    continue
+
+            chunk["trade_date"] = chunk["timestamp"].dt.date
+            frames.append(chunk[["timestamp", "trade_date", "price"]])
+
+    if not frames:
+        return pd.DataFrame(columns=["trade_date", "spot", "spot_time"])
+
+    all_ticks = pd.concat(frames, ignore_index=True).sort_values("timestamp")
+    by_date = (
+        all_ticks.groupby("trade_date", as_index=False)
+        .agg(spot=("price", "last"), spot_time=("timestamp", "last"))
+        .sort_values("trade_date")
+    )
+    return by_date
+
+
 def build_chain_snapshot(
     trades: pd.DataFrame,
+    trades_unfiltered_expiry: pd.DataFrame,
+    spot_by_day: pd.DataFrame,
     expiry_date: dt.date,
     selected_strikes: list[float],
 ) -> pd.DataFrame:
@@ -168,24 +229,87 @@ def build_chain_snapshot(
         how="outer",
     )
 
+    if not spot_by_day.empty:
+        merged = pd.merge(merged, spot_by_day, on="trade_date", how="left")
+    else:
+        merged["spot"] = pd.NA
+        merged["spot_time"] = pd.NaT
+
+    universe = trades_unfiltered_expiry.copy()
+    if universe.empty:
+        merged["atm_strike"] = pd.NA
+    else:
+        universe = universe.sort_values(["trade_date", "strike"]).drop_duplicates(
+            subset=["trade_date", "strike"]
+        )
+        atm_rows: list[dict] = []
+        for trade_day, day_df in universe.groupby("trade_date"):
+            day_spot = merged.loc[merged["trade_date"] == trade_day, "spot"].dropna()
+            if day_spot.empty:
+                continue
+            spot_value = float(day_spot.iloc[0])
+            nearest_idx = (day_df["strike"] - spot_value).abs().idxmin()
+            atm_strike_value = float(day_df.loc[nearest_idx, "strike"])
+            atm_rows.append({"trade_date": trade_day, "atm_strike": atm_strike_value})
+
+        if atm_rows:
+            merged = pd.merge(merged, pd.DataFrame(atm_rows), on="trade_date", how="left")
+        else:
+            merged["atm_strike"] = pd.NA
+
+    merged["CE_moneyness"] = pd.NA
+    merged["PE_moneyness"] = pd.NA
+    valid = merged["atm_strike"].notna() & merged["strike"].notna()
+    merged.loc[valid & (merged["strike"] == merged["atm_strike"]), "CE_moneyness"] = "ATM"
+    merged.loc[valid & (merged["strike"] == merged["atm_strike"]), "PE_moneyness"] = "ATM"
+    merged.loc[valid & (merged["strike"] < merged["atm_strike"]), "CE_moneyness"] = "ITM"
+    merged.loc[valid & (merged["strike"] > merged["atm_strike"]), "CE_moneyness"] = "OTM"
+    merged.loc[valid & (merged["strike"] < merged["atm_strike"]), "PE_moneyness"] = "OTM"
+    merged.loc[valid & (merged["strike"] > merged["atm_strike"]), "PE_moneyness"] = "ITM"
+
     merged = merged.sort_values(["trade_date", "strike"]).reset_index(drop=True)
     return merged
 
 
+def row_color_by_spot_moneyness(row: pd.Series, basis: str) -> list[str]:
+    moneyness_col = "CE_moneyness" if basis == "CALL" else "PE_moneyness"
+    tag = row.get(moneyness_col)
+    if pd.isna(tag):
+        return [""] * len(row)
+    if tag == "ATM":
+        color = "#fff3cd"
+    elif tag == "ITM":
+        color = "#d4edda"
+    else:
+        color = "#f8d7da"
+    return [f"background-color: {color}"] * len(row)
+
+
 st.set_page_config(page_title="BTC Historical Option Chain UI", layout="wide")
 st.title("BTC Historical Option Chain UI (Delta)")
-st.caption("Build chain snapshots from trades using date range and minute-level time.")
+st.caption("Build chain snapshots from options + futures spot with date range and time.")
 
-if not DATA_ROOT.exists():
+if not OPTIONS_DATA_ROOT.exists():
     st.error("Data folder not found: delta/BTC-2026")
     st.stop()
+if not FUTURES_DATA_ROOT.exists():
+    st.error("Spot folder not found: delta/F-BTC-2026")
+    st.stop()
 
-csv_files = discover_monthly_files(str(DATA_ROOT))
-if not csv_files:
+option_csv_files = discover_monthly_files(str(OPTIONS_DATA_ROOT))
+if not option_csv_files:
     st.error("No CSV files found under delta/BTC-2026.")
     st.stop()
 
-min_date, max_date = infer_date_bounds(tuple(csv_files))
+futures_csv_files = discover_monthly_files(str(FUTURES_DATA_ROOT))
+if not futures_csv_files:
+    st.error("No CSV files found under delta/F-BTC-2026.")
+    st.stop()
+
+min_date_opt, max_date_opt = infer_date_bounds(tuple(option_csv_files))
+min_date_fut, max_date_fut = infer_date_bounds(tuple(futures_csv_files))
+min_date = max(min_date_opt, min_date_fut)
+max_date = min(max_date_opt, max_date_fut)
 default_from = min_date
 default_to = max_date
 
@@ -202,7 +326,10 @@ if from_date > to_date:
     st.stop()
 
 with st.spinner("Loading and filtering trades..."):
-    trades = load_trades_filtered(tuple(csv_files), from_date, to_date, time_value)
+    trades = load_trades_filtered(tuple(option_csv_files), from_date, to_date, time_value)
+    spot_by_day = load_futures_spot(tuple(futures_csv_files), from_date, to_date, time_value)
+    all_times_trades = load_trades_filtered(tuple(option_csv_files), from_date, to_date, None)
+    all_times_spot = load_futures_spot(tuple(futures_csv_files), from_date, to_date, None)
 
 if trades.empty:
     st.warning("No trades matched the selected date range and time minute.")
@@ -214,6 +341,11 @@ selected_expiry = st.selectbox("Expiry", options=available_expiries, index=0)
 expiry_trades = trades[trades["expiry_date"].dt.date == selected_expiry]
 available_strikes = sorted(expiry_trades["strike"].unique())
 selected_strikes = st.multiselect("Strikes", options=available_strikes, default=available_strikes)
+moneyness_basis = st.radio(
+    "Row colors (ATM / ITM / OTM)",
+    options=["CALL", "PUT"],
+    horizontal=True,
+)
 
 if not selected_strikes:
     st.warning("Select at least one strike.")
@@ -221,6 +353,8 @@ if not selected_strikes:
 
 chain_df = build_chain_snapshot(
     trades=trades,
+    trades_unfiltered_expiry=expiry_trades,
+    spot_by_day=spot_by_day,
     expiry_date=selected_expiry,
     selected_strikes=selected_strikes,
 )
@@ -229,20 +363,113 @@ if chain_df.empty:
     st.warning("No chain rows for selected expiry/strikes.")
     st.stop()
 
-st.subheader("All Matching Rows")
-st.dataframe(chain_df, use_container_width=True)
+display_columns = [
+    "trade_date",
+    # "spot_time",
+    "CE_moneyness",
+    "spot",
+    "CE_ltp",
+    "strike",
+    "PE_ltp",
+    "PE_moneyness",
+    # "atm_strike",
+    
+    # "CE_volume",
+    # "CE_trades",
+    # "CE_last_trade_time",
+    # "PE_last_trade_time",
+    # "PE_trades",
+    # "PE_volume",
+    
+]
+for col in display_columns:
+    if col not in chain_df.columns:
+        chain_df[col] = pd.NA
 
-latest_trade_date = chain_df["trade_date"].max()
-latest_snapshot = chain_df[chain_df["trade_date"] == latest_trade_date].copy()
+tab1, tab2 = st.tabs(["Chain View", "Strike Specific Data"])
 
-st.subheader("Latest Snapshot In Range")
-st.write(f"Snapshot date: `{latest_trade_date}` at minute `{time_value.strftime('%H:%M')}`")
-st.dataframe(latest_snapshot, use_container_width=True)
+with tab1:
+    st.subheader("All Matching Rows")
+    st.caption("Legend: **ATM** = yellow · **ITM** = green · **OTM** = red")
+    all_styled = chain_df[display_columns].style.apply(
+        row_color_by_spot_moneyness, axis=1, basis=moneyness_basis
+    )
+    st.dataframe(all_styled, use_container_width=True)
 
-csv_bytes = chain_df.to_csv(index=False).encode("utf-8")
-st.download_button(
-    label="Download Filtered Chain (CSV)",
-    data=csv_bytes,
-    file_name=f"BTC_chain_{selected_expiry}_{from_date}_{to_date}_{time_value.strftime('%H%M')}.csv",
-    mime="text/csv",
-)
+    latest_trade_date = chain_df["trade_date"].max()
+    latest_snapshot = chain_df[chain_df["trade_date"] == latest_trade_date].copy()
+    latest_snapshot = latest_snapshot.sort_values("strike")
+
+    st.subheader("Latest Snapshot In Range")
+    st.write(f"Snapshot date: `{latest_trade_date}` at minute `{time_value.strftime('%H:%M')}`")
+    spot_series = latest_snapshot["spot"].dropna()
+    if not spot_series.empty:
+        st.metric("BTC Spot At Selected Time", f"{float(spot_series.iloc[0]):,.2f}")
+    else:
+        st.info("BTC spot not available for selected filters.")
+
+    latest_styled = latest_snapshot[display_columns].style.apply(
+        row_color_by_spot_moneyness, axis=1, basis=moneyness_basis
+    )
+    st.dataframe(latest_styled, use_container_width=True)
+
+    csv_bytes = chain_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download Filtered Chain (CSV)",
+        data=csv_bytes,
+        file_name=f"BTC_chain_{selected_expiry}_{from_date}_{to_date}_{time_value.strftime('%H%M')}.csv",
+        mime="text/csv",
+    )
+
+with tab2:
+    st.subheader("Strike Wise Table (All Available Times)")
+    st.caption("Choose one strike and side to view all timestamps in the selected range.")
+    expiry_all_times = all_times_trades[all_times_trades["expiry_date"].dt.date == selected_expiry].copy()
+    if expiry_all_times.empty:
+        st.warning("No rows matched these filters for all-time view.")
+    else:
+        strike_side_col1, strike_side_col2 = st.columns(2)
+        with strike_side_col1:
+            side_choice = st.radio(
+                "Option Side",
+                options=["CALL", "PUT"],
+                horizontal=True,
+                key="strike_side_choice_delta",
+            )
+        strike_values = sorted(expiry_all_times["strike"].dropna().unique().tolist())
+        with strike_side_col2:
+            selected_abs_strike = st.selectbox(
+                f"Select {side_choice} Strike",
+                options=strike_values,
+                index=0,
+                key="selected_abs_strike_delta",
+            )
+
+        strike_subset = expiry_all_times[expiry_all_times["strike"] == float(selected_abs_strike)].copy()
+        strike_chain = build_chain_snapshot(
+            trades=strike_subset,
+            trades_unfiltered_expiry=expiry_all_times,
+            spot_by_day=all_times_spot,
+            expiry_date=selected_expiry,
+            selected_strikes=[float(selected_abs_strike)],
+        )
+        strike_chain = strike_chain.sort_values("trade_date").reset_index(drop=True)
+
+        metric_prefix = "CE" if side_choice == "CALL" else "PE"
+        table_columns = [
+            "trade_date",
+            "spot_time",
+            "spot",
+            "atm_strike",
+            "strike",
+            f"{metric_prefix}_moneyness",
+            f"{metric_prefix}_ltp",
+            f"{metric_prefix}_volume",
+            f"{metric_prefix}_trades",
+            f"{metric_prefix}_last_trade_time",
+        ]
+        for col in table_columns:
+            if col not in strike_chain.columns:
+                strike_chain[col] = pd.NA
+
+        st.dataframe(strike_chain[table_columns], use_container_width=True)
