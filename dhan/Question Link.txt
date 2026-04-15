@@ -5,4 +5,6 @@ How to get historical data for options
 https://www.youtube.com/watch?v=1huae3_B5mI&lc=Ugxr9vklnAvulVqDVxN4AaABAg
 
 
-
+Ui command
+    pip install streamlit pandas
+    streamlit run "option_chain_ui.py"

@@ -1,11 +1,13 @@
 from pathlib import Path
 import datetime as dt
+import math
 
 import pandas as pd
 import streamlit as st
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent
+RISK_FREE_RATE = 0.05
 
 
 def parse_atm_label(label: str) -> int:
@@ -21,7 +23,7 @@ def parse_atm_label(label: str) -> int:
 @st.cache_data
 def discover_data_roots() -> list[Path]:
     roots = []
-    for path in WORKSPACE_ROOT.glob("*Options data 15 mins"):
+    for path in WORKSPACE_ROOT.glob("*"):
         atm_wise = path / "ATM Wise data"
         if atm_wise.exists():
             roots.append(atm_wise)
@@ -64,6 +66,104 @@ def load_leg_data(csv_path: str) -> pd.DataFrame:
     return df
 
 
+def _safe_float(value) -> float | None:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _year_fraction(expiry_dt: pd.Timestamp, ts: pd.Timestamp) -> float:
+    if pd.isna(expiry_dt) or pd.isna(ts):
+        return 0.0
+    delta_seconds = max((expiry_dt - ts).total_seconds(), 0.0)
+    return max(delta_seconds / (365.0 * 24.0 * 60.0 * 60.0), 1e-9)
+
+
+def _black_scholes_delta(
+    spot: float,
+    strike: float,
+    iv_raw: float,
+    time_to_expiry_years: float,
+    option_type: str,
+    rate: float = RISK_FREE_RATE,
+) -> float | None:
+    if (
+        spot is None
+        or strike is None
+        or iv_raw is None
+        or spot <= 0
+        or strike <= 0
+        or time_to_expiry_years <= 0
+    ):
+        return None
+    sigma = float(iv_raw)
+    if sigma > 1.0:
+        sigma = sigma / 100.0
+    if sigma <= 0:
+        return None
+
+    sqrt_t = math.sqrt(time_to_expiry_years)
+    d1 = (
+        math.log(spot / strike)
+        + (rate + 0.5 * sigma * sigma) * time_to_expiry_years
+    ) / (sigma * sqrt_t)
+
+    nd1 = _norm_cdf(d1)
+    if option_type.upper() in ("CALL", "CE"):
+        return nd1
+    return nd1 - 1.0
+
+
+def add_delta_columns(df: pd.DataFrame, expiry: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    expiry_dt = pd.to_datetime(expiry, errors="coerce")
+    if pd.isna(expiry_dt):
+        out["CE_delta"] = pd.NA
+        out["PE_delta"] = pd.NA
+        return out
+    # End-of-day expiry assumption for intraday bars.
+    expiry_dt = expiry_dt + pd.Timedelta(hours=15, minutes=30)
+
+    ce_delta = []
+    pe_delta = []
+    for _, row in out.iterrows():
+        ts = pd.to_datetime(row.get("datetime"), errors="coerce")
+        tte = _year_fraction(expiry_dt, ts)
+        spot = _safe_float(row.get("spot"))
+
+        ce_delta.append(
+            _black_scholes_delta(
+                spot=spot,
+                strike=_safe_float(row.get("CE_strike")),
+                iv_raw=_safe_float(row.get("CE_iv")),
+                time_to_expiry_years=tte,
+                option_type="CALL",
+            )
+        )
+        pe_delta.append(
+            _black_scholes_delta(
+                spot=spot,
+                strike=_safe_float(row.get("PE_strike")),
+                iv_raw=_safe_float(row.get("PE_iv")),
+                time_to_expiry_years=tte,
+                option_type="PUT",
+            )
+        )
+
+    out["CE_delta"] = ce_delta
+    out["PE_delta"] = pe_delta
+    return out
+
+
 def build_chain_data(
     root: str,
     symbol: str,
@@ -71,7 +171,7 @@ def build_chain_data(
     strikes: list[str],
     from_date: dt.date,
     to_date: dt.date,
-    time_filter: dt.time,
+    time_filter: dt.time | None,
 ) -> pd.DataFrame:
     frames = []
     root_path = Path(root)
@@ -88,7 +188,8 @@ def build_chain_data(
 
         if not ce.empty:
             ce = ce[(ce["datetime"] >= start_ts) & (ce["datetime"] <= end_ts)]
-            ce = ce[ce["datetime"].dt.time == time_filter]
+            if time_filter is not None:
+                ce = ce[ce["datetime"].dt.time == time_filter]
             ce = ce.rename(
                 columns={
                     "open": "CE_open",
@@ -105,7 +206,8 @@ def build_chain_data(
 
         if not pe.empty:
             pe = pe[(pe["datetime"] >= start_ts) & (pe["datetime"] <= end_ts)]
-            pe = pe[pe["datetime"].dt.time == time_filter]
+            if time_filter is not None:
+                pe = pe[pe["datetime"].dt.time == time_filter]
             pe = pe.rename(
                 columns={
                     "open": "PE_open",
@@ -241,6 +343,7 @@ if chain_df.empty:
     st.stop()
 
 chain_df["spot"] = chain_df.get("CE_spot").combine_first(chain_df.get("PE_spot"))
+chain_df = add_delta_columns(chain_df, expiry=expiry)
 
 display_columns = [
     "datetime",
@@ -251,6 +354,7 @@ display_columns = [
     "CE_low",
     "CE_volume",
     "CE_iv",
+    "CE_delta",
     "CE_oi",
     "CE_close",
     "CE_strike",
@@ -261,6 +365,7 @@ display_columns = [
     "PE_low",
     "PE_volume",
     "PE_iv",
+    "PE_delta",
     "PE_oi",
     
 ]
@@ -269,35 +374,120 @@ for col in display_columns:
     if col not in chain_df.columns:
         chain_df[col] = pd.NA
 
-st.subheader("All Matching Rows")
-st.caption("Legend: **ATM** = yellow · **ITM** = green · **OTM** = red")
-all_styled = chain_df[display_columns].style.apply(
-    row_color_by_moneyness, axis=1, basis=moneyness_basis
-)
-st.dataframe(all_styled, use_container_width=True)
+tab1, tab2 = st.tabs(["Chain View", "Range Strike Table"])
 
-st.subheader("Latest Snapshot In Range")
-latest_ts = chain_df["datetime"].max()
-latest_snapshot = chain_df[chain_df["datetime"] == latest_ts].copy()
-latest_snapshot = latest_snapshot.sort_values("atm_distance")
-st.write(f"Snapshot time: `{latest_ts}`")
+with tab1:
+    st.subheader("All Matching Rows")
+    st.caption("Legend: **ATM** = yellow · **ITM** = green · **OTM** = red")
+    all_styled = chain_df[display_columns].style.apply(
+        row_color_by_moneyness, axis=1, basis=moneyness_basis
+    )
+    st.dataframe(all_styled, use_container_width=True)
 
-spot_series = latest_snapshot["spot"].dropna()
-if not spot_series.empty:
-    nifty_spot = float(spot_series.median())
-    st.metric("NIFTY Spot At Selected Time", f"{nifty_spot:.2f}")
-else:
-    st.info("NIFTY spot not available for selected filters.")
+    st.subheader("Latest Snapshot In Range")
+    latest_ts = chain_df["datetime"].max()
+    latest_snapshot = chain_df[chain_df["datetime"] == latest_ts].copy()
+    latest_snapshot = latest_snapshot.sort_values("atm_distance")
+    st.write(f"Snapshot time: `{latest_ts}`")
 
-latest_styled = latest_snapshot[display_columns].style.apply(
-    row_color_by_moneyness, axis=1, basis=moneyness_basis
-)
-st.dataframe(latest_styled, use_container_width=True)
+    spot_series = latest_snapshot["spot"].dropna()
+    if not spot_series.empty:
+        nifty_spot = float(spot_series.median())
+        st.metric("NIFTY Spot At Selected Time", f"{nifty_spot:.2f}")
+    else:
+        st.info("NIFTY spot not available for selected filters.")
 
-csv_bytes = chain_df.to_csv(index=False).encode("utf-8")
-st.download_button(
-    label="Download Filtered Data (CSV)",
-    data=csv_bytes,
-    file_name=f"{symbol}_{expiry}_{from_date}_{to_date}_{time_value}.csv",
-    mime="text/csv",
-)
+    latest_styled = latest_snapshot[display_columns].style.apply(
+        row_color_by_moneyness, axis=1, basis=moneyness_basis
+    )
+    st.dataframe(latest_styled, use_container_width=True)
+
+    csv_bytes = chain_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download Filtered Data (CSV)",
+        data=csv_bytes,
+        file_name=f"{symbol}_{expiry}_{from_date}_{to_date}_{time_value}.csv",
+        mime="text/csv",
+    )
+
+with tab2:
+    st.subheader("Strike Wise Table (All Available Times)")
+    st.caption(
+        "Choose one strike and side. You will get all available timestamps in the selected date range."
+    )
+
+    all_times_df = build_chain_data(
+        root=selected_root,
+        symbol=symbol,
+        expiry=expiry,
+        strikes=selected_strikes,
+        from_date=from_date,
+        to_date=to_date,
+        time_filter=None,
+    )
+
+    if all_times_df.empty:
+        st.warning("No rows matched these filters for all-time view.")
+    else:
+        all_times_df["spot"] = all_times_df.get("CE_spot").combine_first(
+            all_times_df.get("PE_spot")
+        )
+        all_times_df = add_delta_columns(all_times_df, expiry=expiry)
+
+        side_col1, side_col2 = st.columns(2)
+        with side_col1:
+            side_choice = st.radio(
+                "Option Side",
+                options=["CALL", "PUT"],
+                horizontal=True,
+                key="strike_side_choice",
+            )
+
+        strike_col = "CE_strike" if side_choice == "CALL" else "PE_strike"
+        metric_prefix = "CE" if side_choice == "CALL" else "PE"
+        strike_values = (
+            pd.to_numeric(all_times_df.get(strike_col), errors="coerce")
+            .dropna()
+            .astype(int)
+            .sort_values()
+            .unique()
+            .tolist()
+        )
+
+        if not strike_values:
+            st.warning(f"No {side_choice} strike values found in this range.")
+        else:
+            with side_col2:
+                selected_abs_strike = st.selectbox(
+                    f"Select {side_choice} Strike",
+                    options=strike_values,
+                    index=0,
+                    key="selected_abs_strike",
+                )
+
+            strike_mask = (
+                pd.to_numeric(all_times_df[strike_col], errors="coerce")
+                == float(selected_abs_strike)
+            )
+            strike_rows = all_times_df[strike_mask].copy()
+            strike_rows = strike_rows.sort_values("datetime").reset_index(drop=True)
+
+            table_columns = [
+                "datetime",
+                "atm_label",
+                "spot",
+                f"{metric_prefix}_strike",
+                f"{metric_prefix}_open",
+                f"{metric_prefix}_high",
+                f"{metric_prefix}_low",
+                f"{metric_prefix}_close",
+                f"{metric_prefix}_volume",
+                f"{metric_prefix}_iv",
+                f"{metric_prefix}_delta",
+                f"{metric_prefix}_oi",
+            ]
+            for col in table_columns:
+                if col not in strike_rows.columns:
+                    strike_rows[col] = pd.NA
+
+            st.dataframe(strike_rows[table_columns], use_container_width=True)
