@@ -45,9 +45,9 @@ def two_month_window_start_for_expiry(expiry_date):
     return datetime.date(expiry_date.year, expiry_date.month - 1, 1)
 
 
-def month_end(day):
-    last_day = calendar.monthrange(day.year, day.month)[1]
-    return datetime.date(day.year, day.month, last_day)
+# Match quarterly-style batching: each API call covers at most this many calendar days
+# (e.g. Feb expiry: 1–30 Jan, then 31 Jan–expiry).
+CHUNK_DAYS = 30
 
 
 def month_diff(start_day, end_day):
@@ -76,7 +76,10 @@ for name in watchlist:
                     run_date = current_start
 
                     while run_date <= expiry_date:
-                        run_end = min(month_end(run_date), expiry_date)
+                        run_end = min(
+                            run_date + datetime.timedelta(days=CHUNK_DAYS - 1),
+                            expiry_date,
+                        )
                         expiry_code = month_diff(run_date, expiry_date) + 1
                         expiry_code = max(1, min(3, expiry_code))
 
