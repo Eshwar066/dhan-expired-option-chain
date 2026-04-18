@@ -55,7 +55,6 @@ def month_diff(start_day, end_day):
 
 
 expiries = generate_monthly_expiries(start_year, end_year)
-previous_expiry = None
 
 for name in watchlist:
     security_id = security_ids.get(name)
@@ -63,11 +62,9 @@ for name in watchlist:
         raise ValueError(f"Missing security ID for {name}")
 
     for expiry_date in expiries:
-        window_start = two_month_window_start_for_expiry(expiry_date)
-        if previous_expiry is None:
-            current_start = window_start
-        else:
-            current_start = max(window_start, previous_expiry + datetime.timedelta(days=1))
+        # Always from prior month 1st: same calendar dates can repeat across series
+        # (e.g. Feb 1–27) but API needs each expiry's own expiry_code.
+        current_start = two_month_window_start_for_expiry(expiry_date)
 
         for rangex in atm_range:
             for right in ["CALL", "PUT"]:
@@ -116,5 +113,3 @@ for name in watchlist:
                 except Exception as e:
                     print(f"{name} {expiry_date} {right} {rangex}: Error {e}")
                     continue
-
-        previous_expiry = expiry_date
