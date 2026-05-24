@@ -303,6 +303,12 @@ if not strikes:
 with col3:
     selected_strikes = st.multiselect("ATM Labels", options=strikes, default=strikes)
 
+TIME_PRESETS = (
+    ("9:30", dt.time(9, 30)),
+    ("10:45", dt.time(10, 45)),
+    ("3:15", dt.time(15, 15)),
+)
+
 filter_col1, filter_col2, filter_col3 = st.columns(3)
 today = dt.date.today()
 default_from = today - dt.timedelta(days=7)
@@ -311,7 +317,20 @@ with filter_col1:
 with filter_col2:
     to_date = st.date_input("To Date", value=today)
 with filter_col3:
-    time_value = st.time_input("Time", value=dt.time(9, 15))
+    if "chain_filter_time" not in st.session_state:
+        st.session_state.chain_filter_time = dt.time(9, 30)
+    time_value = st.time_input(
+        "Time",
+        value=st.session_state.chain_filter_time,
+    )
+    st.session_state.chain_filter_time = time_value
+    preset_cols = st.columns(3)
+    for col, (label, preset) in zip(preset_cols, TIME_PRESETS):
+        with col:
+            if st.button(label, use_container_width=True, key=f"time_preset_{label}"):
+                st.session_state.chain_filter_time = preset
+                st.rerun()
+    time_value = st.session_state.chain_filter_time
 
 moneyness_basis = st.radio(
     "Row colors (ATM / ITM / OTM)",
@@ -349,23 +368,23 @@ display_columns = [
     "datetime",
     "atm_label",
     "spot",
-    "CE_open",
-    "CE_high",
-    "CE_low",
-    "CE_volume",
-    "CE_iv",
-    "CE_delta",
+    # "CE_open",
+    # "CE_high",
+    # "CE_low",
+    # "CE_volume",
+    # "CE_iv",
+    # "CE_delta",
     "CE_oi",
     "CE_close",
     "CE_strike",
     "PE_strike",
     "PE_close",
-    "PE_open",
-    "PE_high",
-    "PE_low",
-    "PE_volume",
-    "PE_iv",
-    "PE_delta",
+    # "PE_open",
+    # "PE_high",
+    # "PE_low",
+    # "PE_volume",
+    # "PE_iv",
+    # "PE_delta",
     "PE_oi",
     
 ]
